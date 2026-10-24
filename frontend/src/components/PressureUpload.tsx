@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import axios from "axios";
+import api from "../api";
 import { useDropzone } from "react-dropzone";
 import { UploadCloud, CheckCircle2, AlertCircle } from "lucide-react";
 
@@ -20,8 +20,8 @@ export default function PressureUpload() {
 
   // Load patients from your ClinicianPatientsView
   useEffect(() => {
-    axios
-      .get("http://localhost:8000/api/clinician/patients/") 
+    api
+      .get("/api/clinician/patients/")
       .then((res) => {
         // Ensure res.data is an array before setting
         setPatients(Array.isArray(res.data) ? res.data : []);
@@ -63,8 +63,8 @@ export default function PressureUpload() {
     try {
       setUploadProgress(1); // Start progress bar
       
-      await axios.post(
-        "http://localhost:8000/api/upload-pressure/", // URL from your urls.py
+      await api.post(
+        "/api/upload-pressure/",
         formData,
         {
           headers: { "Content-Type": "multipart/form-data" },

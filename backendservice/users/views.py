@@ -21,10 +21,18 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 
 from backendservice import settings
 
 from .models import ClinicianPatientAssignment, PressureRawUpload, SessionWindow
+from .permissions import (
+    IsAdminRole,
+    IsAdminOrClinician,
+    IsClinicianOrPatient,
+    can_view_patient_data,
+    is_assigned,
+)
 from .serializers import (
     UserSerializer,
     AdminUserSerializer,
@@ -43,14 +51,15 @@ User = get_user_model()
 # Authentication & Users
 # -------------------------------
 class CreateUserView(generics.CreateAPIView):
+    # Public self-registration is disabled: only admins can provision accounts.
     queryset = User.objects.all()
     serializer_class = UserSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
 class AdminCreateUserView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = AdminUserSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -64,13 +73,14 @@ class SecureTokenView(TokenObtainPairView):
 class LogoutView(APIView):
     permission_classes = (IsAuthenticated,)
     def post(self, request):
+        refresh_token = request.data.get("refresh")
+        if not refresh_token:
+            return Response({"detail": "refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            refresh_token = request.data["refresh"]
-            token = RefreshToken(refresh_token)
-            token.blacklist()
-            return Response(status=status.HTTP_205_RESET_CONTENT)
-        except Exception:
-            return Response(status=status.HTTP_400_BAD_REQUEST)
+            RefreshToken(refresh_token).blacklist()
+        except TokenError:
+            return Response({"detail": "Invalid or expired token."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_205_RESET_CONTENT)
 
 # -------------------------------
 # Password Reset Logic
@@ -118,20 +128,29 @@ def reset_password(request):
 class ClinicianListView(generics.ListAPIView):
     queryset = User.objects.filter(role='clinician').order_by('last_name', 'first_name')
     serializer_class = ClinicianSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
 
 class ClinicianPatientsView(generics.ListAPIView):
+    """Admins see every active patient (for uploads); clinicians see only their assigned patients."""
     serializer_class = ClinicianPatientsSerializer
-    permission_classes = [AllowAny]  
+    permission_classes = [IsAdminOrClinician]
+
     def get_queryset(self):
-        return User.objects.filter(role='patient', is_active=True).order_by('-date_joined')
+        user = self.request.user
+        patients = User.objects.filter(role='patient', is_active=True)
+        if user.role == 'clinician':
+            patients = patients.filter(
+                assigned_clinicians__clinician=user,
+                assigned_clinicians__is_active=True,
+            )
+        return patients.distinct().order_by('-date_joined')
 
 # -------------------------------
 # Pressure Data Upload & Processing
 # -------------------------------
 class PressureRawUploadView(generics.CreateAPIView):
     serializer_class = PressureRawUploadSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminRole]
     parser_classes = [MultiPartParser, FormParser]
 
     def perform_create(self, serializer):
@@ -161,10 +180,20 @@ from rest_framework.views import APIView
 
 
 from rest_framework import generics, permissions, status
+from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.response import Response
 from .models import FeedbackComment, User
 from .serializers import FeedbackCommentSerializer
 
+
+
+def _patient_or_none(patient_id):
+    """Look up a patient by id, treating non-numeric ids (e.g. 'me') as not found instead of erroring."""
+    try:
+        pk = int(patient_id)
+    except (TypeError, ValueError):
+        return None
+    return User.objects.filter(id=pk, role="patient").first()
 
 
 class FeedbackCommentsView(generics.ListAPIView):
@@ -180,11 +209,15 @@ class FeedbackCommentsView(generics.ListAPIView):
                 patient=user,
                 parent__isnull=True
             ).select_related('author', 'patient', 'clinician').prefetch_related('replies__author')
-        else:
+        elif user.role == 'clinician':
+            patient = _patient_or_none(patient_id)
+            if not can_view_patient_data(user, patient):
+                raise PermissionDenied("This patient is not assigned to you.")
             return FeedbackComment.objects.filter(
                 patient_id=patient_id,
                 parent__isnull=True
             ).select_related('author', 'patient', 'clinician').prefetch_related('replies__author')
+        raise PermissionDenied("Admins cannot read patient feedback.")
 
 
 class FeedbackReplyCreateView(generics.CreateAPIView):
@@ -208,6 +241,8 @@ class FeedbackReplyCreateView(generics.CreateAPIView):
             return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
         if user.role == 'clinician' and parent_comment.clinician != user:
             return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
+        if user.role not in ('patient', 'clinician'):
+            return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
 
         reply = FeedbackComment.objects.create(
             patient=parent_comment.patient,
@@ -224,29 +259,22 @@ class FeedbackReplyCreateView(generics.CreateAPIView):
 
    
 class UserListView(generics.ListAPIView):
-    queryset = User.objects.all()
-    serializer_class = UserSerializer   
-    permission_classes = [AllowAny]
+    queryset = User.objects.all().order_by('id')
+    serializer_class = UserSerializer
+    permission_classes = [IsAdminRole]
 
 class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer
+    permission_classes = [IsAdminRole]
 
 
 class ComparisonHeatmapView(APIView):
-    authentication_classes = []
-    permission_classes = [AllowAny]
+    permission_classes = [IsClinicianOrPatient]
 
     def get_upload_queryset(self, request):
-        patient_id = request.query_params.get("patient") or request.query_params.get("patient_id")
-
-        if patient_id:
-            return PressureRawUpload.objects.filter(patient_id=patient_id)
-
-        if request.user and request.user.is_authenticated:
-            return PressureRawUpload.objects.filter(patient=request.user)
-
-        return PressureRawUpload.objects.none()
+        patient = get_authorised_patient(request)
+        return PressureRawUpload.objects.filter(patient=patient)
 
     def get_period_bounds(self, anchor, period):
         if period == "this_hour":
@@ -350,19 +378,14 @@ class PatientFeedbackCreateView(generics.CreateAPIView):
                 is_active=True
             ).first()
 
-            if assignment:
-                clinician_id = assignment.clinician_id
-            else:
-                first_clinician = User.objects.filter(role='clinician').first()
-                if first_clinician:
-                    clinician_id = first_clinician.id
-                else:
-                    return Response(
-                        {'detail': 'No clinician available to receive feedback.'},
-                        status=status.HTTP_404_NOT_FOUND
-                    )
+            if not assignment:
+                return Response(
+                    {'detail': 'You have no assigned clinician yet.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            clinician_id = assignment.clinician_id
             patient = user
-        else:
+        elif user.role == 'clinician':
             patient_id = request.data.get('patient')
             if not patient_id:
                 return Response(
@@ -376,7 +399,11 @@ class PatientFeedbackCreateView(generics.CreateAPIView):
                     {'detail': 'Patient not found.'},
                     status=status.HTTP_404_NOT_FOUND
                 )
+            if not is_assigned(user, patient):
+                return Response({'detail': 'This patient is not assigned to you.'}, status=status.HTTP_403_FORBIDDEN)
             clinician_id = user.id
+        else:
+            return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
 
         comment = FeedbackComment.objects.create(
             patient=patient,
@@ -390,19 +417,30 @@ class PatientFeedbackCreateView(generics.CreateAPIView):
         serializer = self.get_serializer(comment)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-def _get_target_patient(request):
+def get_authorised_patient(request):
+    """Return the patient whose clinical data is requested, or raise 403/404.
+
+    Patients may omit ``patient_id`` (or pass their own); clinicians must pass the id of a patient
+    assigned to them. Every clinical-data endpoint goes through this check.
+    """
     patient_id = (
         request.query_params.get("patient_id")
         or request.query_params.get("patient")
     )
+    user = request.user
 
     if patient_id:
-        return User.objects.filter(id=patient_id, role="patient").first()
+        patient = _patient_or_none(patient_id)
+        if patient is None:
+            raise NotFound("Patient not found.")
+    elif getattr(user, "role", None) == "patient":
+        patient = user
+    else:
+        raise NotFound("patient_id is required.")
 
-    if getattr(request.user, "is_authenticated", False) and request.user.role == "patient":
-        return request.user
-
-    return None
+    if not can_view_patient_data(user, patient):
+        raise PermissionDenied("You do not have access to this patient's data.")
+    return patient
 
 
 def _get_latest_upload_for_patient(patient):
@@ -457,23 +495,13 @@ def _build_alert_payload(window):
     }
 
 class LatestHeatmapView(APIView):
-    authentication_classes = []
-    permission_classes = [AllowAny]
+    permission_classes = [IsClinicianOrPatient]
 
     def get(self, request):
-        patient_id = (
-            request.query_params.get('patient_id')
-            or request.query_params.get('patient')
-        )
-
-        if patient_id:
-            qs = PressureRawUpload.objects.filter(
-                patient_id=patient_id
-            ).order_by("-recorded_at", "-uploaded_at")
-        else:
-            qs = PressureRawUpload.objects.filter(
-                patient=request.user
-            ).order_by("-recorded_at", "-uploaded_at")
+        patient = get_authorised_patient(request)
+        qs = PressureRawUpload.objects.filter(
+            patient=patient
+        ).order_by("-recorded_at", "-uploaded_at")
 
         upload = next((u for u in qs if u.file and os.path.exists(u.file.path)), None)
 
@@ -511,20 +539,13 @@ class LatestHeatmapView(APIView):
         })
 
 class ClinicianHeatmapView(APIView):
-    authentication_classes = []
-    permission_classes = [AllowAny]
+    permission_classes = [IsClinicianOrPatient]
 
     def get(self, request):
-        patient_id = request.query_params.get('patient_id')
-
-        if patient_id:
-            qs = PressureRawUpload.objects.filter(
-                patient_id=patient_id
-            ).order_by("-recorded_at", "-uploaded_at")
-        else:
-            qs = PressureRawUpload.objects.filter(
-                patient=request.user
-            ).order_by("-recorded_at", "-uploaded_at")
+        patient = get_authorised_patient(request)
+        qs = PressureRawUpload.objects.filter(
+            patient=patient
+        ).order_by("-recorded_at", "-uploaded_at")
 
         upload = next((u for u in qs if u.file and os.path.exists(u.file.path)), None)
             
@@ -562,15 +583,10 @@ class ClinicianHeatmapView(APIView):
         })
 
 class PressureAlertsView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsClinicianOrPatient]
 
     def get(self, request):
-        patient = _get_target_patient(request)
-        if patient is None:
-            return Response(
-                {"detail": "Patient not found for alert lookup."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+        patient = get_authorised_patient(request)
 
         upload = _get_latest_upload_for_patient(patient)
         if upload is None:
@@ -614,32 +630,23 @@ class PressureAlertsView(APIView):
 
 class PressureWindowSeriesView(generics.ListAPIView):
     serializer_class = SessionWindowPointSerializer
-    authentication_classes = []
-    permission_classes = [AllowAny]
+    permission_classes = [IsClinicianOrPatient]
 
     def get_queryset(self):
         range_key = self.request.query_params.get("range", "1h")
-        patient_id = self.request.query_params.get('patient_id') or self.request.query_params.get('patient')
+        patient = get_authorised_patient(self.request)
         delta = {
             "1h": timedelta(hours=1),
             "6h": timedelta(hours=6),
             "24h": timedelta(hours=24),
         }.get(range_key, timedelta(hours=1))
 
-        if patient_id:
-            latest_upload = (
-                PressureRawUpload.objects
-                .filter(patient_id=patient_id)
-                .order_by("-recorded_at", "-uploaded_at")
-                .first()
-            )
-        else:
-            latest_upload = (
-                PressureRawUpload.objects
-                .filter(patient=self.request.user)
-                .order_by("-recorded_at", "-uploaded_at")
-                .first()
-            )
+        latest_upload = (
+            PressureRawUpload.objects
+            .filter(patient=patient)
+            .order_by("-recorded_at", "-uploaded_at")
+            .first()
+        )
 
         if not latest_upload:
             return SessionWindow.objects.none()

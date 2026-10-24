@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Users, Search, Edit, Trash2, Shield, X, Save, Download } from 'lucide-react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import api from '../api';
 
 interface User {
   id: string;
@@ -28,11 +29,8 @@ export function UserManagement() {
     const fetchUsers = async () => {
       try {
         setLoading(true);
-        const response = await fetch('http://127.0.0.1:8000/api/users/');
-        if (!response.ok) {
-          throw new Error('Failed to fetch users');
-        }
-        const data = await response.json();
+        // api attaches the admin's JWT; the endpoint is admin-only
+        const { data } = await api.get('/api/users/');
 
         const transformedUsers: User[] = data.map((user: any) => ({
           id: user.id.toString(),
@@ -42,7 +40,7 @@ export function UserManagement() {
           name: `${user.first_name} ${user.last_name}`.trim() || user.username,
           email: user.email,
           role: user.role as 'patient' | 'clinician' | 'admin',
-          status: 'active',
+          status: user.is_active === false ? 'inactive' : 'active',
         }));
 
         setUsers(transformedUsers);
@@ -63,24 +61,14 @@ export function UserManagement() {
 
   const handleSaveChanges = async () => {
     try {
-      const response = await fetch(`/api/users/${editFormData.id}/`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          first_name: editFormData.firstName,
-          last_name: editFormData.lastName,
-          username: editFormData.username,
-          email: editFormData.email,
-          role: editFormData.role,
-          is_active: editFormData.status === 'active',
-        }),
+      await api.patch(`/api/users/${editFormData.id}/`, {
+        first_name: editFormData.firstName,
+        last_name: editFormData.lastName,
+        username: editFormData.username,
+        email: editFormData.email,
+        role: editFormData.role,
+        is_active: editFormData.status === 'active',
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to update user');
-      }
 
       const updatedUsers = users.map((u) =>
         u.id === editFormData.id
@@ -103,13 +91,7 @@ export function UserManagement() {
     if (!window.confirm(`Are you sure you want to delete ${userName}?`)) return;
 
     try {
-      const response = await fetch(`/api/users/${userId}/`, {
-        method: 'DELETE',
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to delete user');
-      }
+      await api.delete(`/api/users/${userId}/`);
 
       setUsers(users.filter((user) => user.id !== userId));
     } catch (err) {

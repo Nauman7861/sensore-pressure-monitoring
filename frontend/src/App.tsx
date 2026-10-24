@@ -9,7 +9,8 @@ import ForgotPassword from './components/ForgotPassword';
 import ResetPassword from './components/ResetPassword';
 import PressureUpload from "./components/PressureUpload";
 import { jwtDecode } from 'jwt-decode';
-import { ACCESS_TOKEN } from './constants';
+import { ACCESS_TOKEN, REFRESH_TOKEN } from './constants';
+import api from './api';
 
 function AppContent() {
   const navigate = useNavigate();
@@ -45,7 +46,16 @@ function AppContent() {
     setIsLoggedIn(true);
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    // Revoke the refresh token on the server so it cannot be reused after logout
+    const refresh = localStorage.getItem(REFRESH_TOKEN);
+    if (refresh) {
+      try {
+        await api.post('/api/logout/', { refresh });
+      } catch {
+        // Still log out locally if the server call fails
+      }
+    }
     localStorage.clear();
     setIsLoggedIn(false);
     setCurrentUser({ id: '', email: '', name: '', role: 'patient' });

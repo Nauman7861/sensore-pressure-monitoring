@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth import get_user_model
-from .models import PressureRawUpload, SessionWindow, ClinicianPatientAssignment
+from django.db import transaction
+from .models import PressureRawUpload, SessionWindow, ClinicianPatientAssignment, PatientProfile
 import numpy as np
 from django.utils import timezone
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -14,7 +15,7 @@ class UserSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(source='get_role_display', read_only=True)
     class Meta:
         model = User
-        fields = ['id', 'username', 'first_name', 'last_name', 'email', 'role', 'role_display', 'password']
+        fields = ['id', 'username', 'first_name', 'last_name', 'email', 'role', 'role_display', 'password', 'is_active']
         extra_kwargs = {'password': {'write_only': True}}
 
     def validate_password(self, value):
@@ -26,8 +27,45 @@ class UserSerializer(serializers.ModelSerializer):
         user = User.objects.create_user(password=password, **validated_data)
         return user
 
+    def update(self, instance, validated_data):
+        # Hash a new password instead of storing the raw string on the model
+        password = validated_data.pop('password', None)
+        user = super().update(instance, validated_data)
+        if password:
+            user.set_password(password)
+            user.save(update_fields=['password'])
+        return user
+
+
 class AdminUserSerializer(UserSerializer):
-    pass
+    """Used by admins to create accounts. A patient can be assigned to a clinician at creation time."""
+    clinician = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(role='clinician'), write_only=True, required=False, allow_null=True
+    )
+    mat_device_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
+
+    class Meta(UserSerializer.Meta):
+        fields = UserSerializer.Meta.fields + ['clinician', 'mat_device_id']
+
+    def validate(self, attrs):
+        if attrs.get('role') != 'patient' and (attrs.get('clinician') or attrs.get('mat_device_id')):
+            raise serializers.ValidationError("Only patient accounts can have a clinician or mat device.")
+        device = attrs.get('mat_device_id')
+        if device and PatientProfile.objects.filter(mat_device_id=device).exists():
+            raise serializers.ValidationError({"mat_device_id": "This mat device is already registered."})
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        clinician = validated_data.pop('clinician', None)
+        mat_device_id = validated_data.pop('mat_device_id', '')
+        user = super().create(validated_data)
+        if user.role == 'patient':
+            if mat_device_id:
+                PatientProfile.objects.create(user=user, mat_device_id=mat_device_id)
+            if clinician:
+                ClinicianPatientAssignment.objects.create(clinician=clinician, patient=user)
+        return user
 
 class ClinicianSerializer(serializers.ModelSerializer):
     class Meta:
